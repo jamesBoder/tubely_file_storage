@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"crypto/rand"
+	crand "crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -114,6 +117,32 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// debug print after copy
+	fmt.Println("Copied uploaded file to temp file")
+
+	//get aspect ratio of the video file. Depending on the aspect ratio, add "landscape", "portrait", or "other" prefix to the key
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to get video aspect ratio", err)
+		return
+	}
+
+	// debug print aspect ratio
+	fmt.Println("Video aspect ratio:", aspectRatio)
+
+	// determine prefix based on aspect ratio
+	aspectRatioPrefix := "other"
+	switch aspectRatio {
+	case "16:9", "4:3":
+		aspectRatioPrefix = "landscape"
+	case "9:16", "3:4":
+		aspectRatioPrefix = "portrait"
+	}
+	fmt.Println("aspect ratio:", aspectRatio, "prefix:", aspectRatioPrefix)
+
+	// debug print temp.seek
+	fmt.Println("Seeked temp file to beginning")
+
 	// reset the tempFile's file pointer to the beginning with .Seek(0,io.SeekStart)
 	_, err = tempFile.Seek(0, io.SeekStart)
 	if err != nil {
@@ -121,26 +150,23 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// debug print temp.seek
-	fmt.Println("Seeked temp file to beginning")
-
 	// generate random 32 byte hex filename
 	randomBytes := make([]byte, 32)
-	_, err = rand.Read(randomBytes)
+	_, err = crand.Read(randomBytes)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error generating random filename", err)
 		return
 	}
 	// make a 64-char lowercase hex string using hex encoding
-	randomFilename := hex.EncodeToString(randomBytes)
+	randomHexFilename := hex.EncodeToString(randomBytes)
 
 	// debug print before upload to S3
-	fmt.Println("Uploading file to S3 with key:", randomFilename+".mp4")
+	fmt.Println("Uploading file to S3 with key:", randomHexFilename+".mp4")
 
-	// upload the file to S3
-	s3Key := fmt.Sprintf("videos/%s.mp4", randomFilename)
+	// upload the file to S3 with aspect ratio prefix in the path
+	s3Key := fmt.Sprintf("videos/%s/%s.mp4", aspectRatioPrefix, randomHexFilename)
 
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
 	defer cancel()
 
 	// debug print
@@ -177,4 +203,62 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 	respondWithJSON(w, http.StatusOK, response)
 
+}
+
+// create getVideoAspectRatio. Takes a file path and returns the aspect ratio as a string
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	var ff struct {
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+			Width     int    `json:"width"`
+			Height    int    `json:"height"`
+			Tags      struct {
+				Rotate string `json:"rotate"`
+			} `json:"tags"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &ff); err != nil {
+		return "", err
+	}
+
+	// Go
+	for _, s := range ff.Streams {
+		if s.CodecType != "video" {
+			continue
+		}
+		if s.Width <= 0 || s.Height <= 0 {
+			continue
+		}
+		w, h := s.Width, s.Height
+		if s.Tags.Rotate == "90" || s.Tags.Rotate == "270" {
+			w, h = h, w
+		}
+
+		// debug print width and height
+		fmt.Printf("Video width: %d, height: %d\n", w, h)
+
+		ar := float64(w) / float64(h)
+
+		if ar > 1.6 && ar < 1.85 {
+			return "16:9", nil
+		}
+		if ar > 1.28 && ar < 1.36 {
+			return "4:3", nil
+		}
+		if ar > 0.53 && ar < 0.62 {
+			return "9:16", nil
+		}
+		if ar > 0.73 && ar < 0.82 {
+			return "3:4", nil
+		}
+	}
+	// no match found
+	return "other", nil
 }
